@@ -3,6 +3,13 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from sklearn.compose import ColumnTransformer
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
 st.set_page_config(
@@ -47,6 +54,86 @@ def load_data():
         ).astype(str)
 
     return data
+
+
+@st.cache_data(show_spinner="Menguji kontribusi faktor dengan validasi silang...")
+def calculate_multivariable_importance(data):
+    excluded_columns = [
+        "Attrition",
+        "EmployeeId",
+        "EmployeeCount",
+        "Over18",
+        "StandardHours",
+    ]
+    derived_columns = [
+        column
+        for column in data.columns
+        if column.endswith("Label") or column.endswith("Group")
+    ]
+    predictors = data.drop(columns=excluded_columns + derived_columns)
+    target = data["Attrition"]
+
+    numeric_columns = predictors.select_dtypes(include="number").columns.tolist()
+    categorical_columns = predictors.select_dtypes(exclude="number").columns.tolist()
+    preprocessing = ColumnTransformer(
+        transformers=[
+            ("numeric", StandardScaler(), numeric_columns),
+            ("categorical", OneHotEncoder(handle_unknown="ignore"), categorical_columns),
+        ]
+    )
+    model = Pipeline(
+        steps=[
+            ("preprocessing", preprocessing),
+            (
+                "classifier",
+                LogisticRegression(
+                    class_weight="balanced",
+                    max_iter=2000,
+                    random_state=42,
+                ),
+            ),
+        ]
+    )
+
+    cross_validation = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    fold_importances = []
+    fold_auc_scores = []
+    for fold_number, (train_indices, test_indices) in enumerate(
+        cross_validation.split(predictors, target)
+    ):
+        train_features = predictors.iloc[train_indices]
+        test_features = predictors.iloc[test_indices]
+        train_target = target.iloc[train_indices]
+        test_target = target.iloc[test_indices]
+
+        model.fit(train_features, train_target)
+        fold_auc_scores.append(
+            roc_auc_score(test_target, model.predict_proba(test_features)[:, 1])
+        )
+        permutation = permutation_importance(
+            model,
+            test_features,
+            test_target,
+            scoring="roc_auc",
+            n_repeats=8,
+            random_state=42 + fold_number,
+            n_jobs=1,
+        )
+        fold_importances.append(
+            pd.Series(permutation.importances_mean, index=predictors.columns)
+        )
+
+    importance_by_fold = pd.DataFrame(fold_importances)
+    importance = pd.DataFrame(
+        {
+            "Faktor": importance_by_fold.columns,
+            "Penurunan AUC": importance_by_fold.mean(axis=0).values,
+            "Konsistensi positif": (importance_by_fold > 0).mean(axis=0).values,
+        }
+    ).sort_values("Penurunan AUC", ascending=False)
+    mean_auc = sum(fold_auc_scores) / len(fold_auc_scores)
+    auc_std = pd.Series(fold_auc_scores).std()
+    return importance, mean_auc, auc_std
 
 
 try:
@@ -171,7 +258,89 @@ with right:
         )
 
 st.divider()
-st.subheader("Pola yang perlu ditindaklanjuti")
+st.subheader("Kontribusi faktor setelah dipertimbangkan bersama")
+importance, mean_auc, auc_std = calculate_multivariable_importance(employee_data)
+auc_column, method_column = st.columns([1, 3])
+auc_column.metric("ROC-AUC validasi silang", f"{mean_auc:.3f} +/- {auc_std:.3f}")
+method_column.caption(
+    "Model regresi logistik diuji dengan stratified 5-fold cross-validation. "
+    "ROC-AUC merangkum kemampuan model membedakan dua kelas pada tiap fold."
+)
+
+factor_labels = {
+    "Age": "Usia",
+    "BusinessTravel": "Perjalanan dinas",
+    "DailyRate": "Tarif harian",
+    "Department": "Departemen",
+    "DistanceFromHome": "Jarak dari rumah",
+    "Education": "Pendidikan",
+    "EducationField": "Bidang pendidikan",
+    "EnvironmentSatisfaction": "Kepuasan lingkungan kerja",
+    "Gender": "Gender",
+    "HourlyRate": "Tarif per jam",
+    "JobInvolvement": "Keterlibatan kerja",
+    "JobLevel": "Level jabatan",
+    "JobRole": "Peran pekerjaan",
+    "JobSatisfaction": "Kepuasan kerja",
+    "MaritalStatus": "Status pernikahan",
+    "MonthlyIncome": "Pendapatan bulanan",
+    "MonthlyRate": "Tarif bulanan",
+    "NumCompaniesWorked": "Jumlah perusahaan sebelumnya",
+    "OverTime": "Overtime",
+    "PercentSalaryHike": "Kenaikan gaji",
+    "PerformanceRating": "Penilaian kinerja",
+    "RelationshipSatisfaction": "Kepuasan hubungan kerja",
+    "StockOptionLevel": "Level opsi saham",
+    "TotalWorkingYears": "Total pengalaman kerja",
+    "TrainingTimesLastYear": "Frekuensi pelatihan tahun lalu",
+    "WorkLifeBalance": "Keseimbangan kehidupan-kerja",
+    "YearsAtCompany": "Masa kerja di perusahaan",
+    "YearsInCurrentRole": "Masa kerja di peran saat ini",
+    "YearsSinceLastPromotion": "Tahun sejak promosi terakhir",
+    "YearsWithCurrManager": "Masa kerja dengan manajer saat ini",
+}
+top_importance = importance.head(10).copy()
+top_importance["Faktor"] = top_importance["Faktor"].map(factor_labels).fillna(
+    top_importance["Faktor"]
+)
+top_importance["Konsistensi positif"] = (
+    top_importance["Konsistensi positif"] * 100
+).map(lambda value: f"{value:.0f}%")
+top_importance["Penurunan AUC"] = top_importance["Penurunan AUC"].map(
+    lambda value: f"{value:.4f}"
+)
+
+importance_chart = px.bar(
+    top_importance.sort_values("Penurunan AUC"),
+    x="Penurunan AUC",
+    y="Faktor",
+    orientation="h",
+    color="Konsistensi positif",
+    labels={
+        "Penurunan AUC": "Penurunan rata-rata ROC-AUC setelah faktor diacak",
+        "Konsistensi positif": "Fold dengan kontribusi positif",
+    },
+    color_continuous_scale="Tealrose",
+)
+importance_chart.update_layout(
+    margin=dict(l=10, r=15, t=10, b=10),
+    height=400,
+    coloraxis_colorbar_title="Fold (%)",
+)
+st.plotly_chart(importance_chart, width="stretch")
+st.dataframe(
+    top_importance[["Faktor", "Penurunan AUC", "Konsistensi positif"]],
+    hide_index=True,
+    width="stretch",
+)
+st.caption(
+    "Semakin besar penurunan AUC setelah satu faktor diacak, semakin besar kontribusi "
+    "prediktif relatif faktor itu pada model ini. Ini bukan arah pengaruh atau bukti sebab-akibat; "
+    "faktor yang saling berkaitan dapat berbagi kontribusi."
+)
+
+st.divider()
+st.subheader("Pola per faktor secara terpisah")
 
 factor_summaries = []
 for feature_label, column in feature_options.items():
